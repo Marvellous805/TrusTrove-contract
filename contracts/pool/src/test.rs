@@ -1578,12 +1578,11 @@ fn test_fund_invoice_rejects_discount_above_max_before_escrow_or_state_update() 
 }
 // A pathologically large face_value read from the invoice contract (the pool
 // does not bound cross-contract values itself) must trigger the typed
-// PoolError::Overflow (#13) in the funded_amount multiplication rather than
-// an untyped arithmetic-overflow abort (#585).
+// PoolError::Overflow (#13) before pool or escrow state changes.
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
-fn test_fund_invoice_rejects_funded_amount_overflow() {
+fn test_fund_invoice_rejects_funded_amount_overflow_without_state_changes() {
     let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
 
     // Stand-in invoice contract reporting a face_value that overflows u128
     // when scaled by (10000 - discount_bps). The issuer/buyer it reports are
@@ -1608,9 +1607,40 @@ fn test_fund_invoice_rejects_funded_amount_overflow() {
     });
 
     let invoice_id = BytesN::from_array(&te.env, &[7u8; 32]);
-    te.pool.fund_invoice(&invoice_id);
-}
+    let escrow = RealEscrowClient::new(&te.env, &te.escrow_id);
+    let stats_before = te.pool.get_stats();
+    let result = te.pool.try_fund_invoice(&invoice_id);
+    assert!(result.is_err(), "overflowing funded amount must be rejected");
+    let error = std::format!("{result:?}");
+    assert!(error.contains("#13"), "expected PoolError::Overflow: {error}");
 
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    assert_eq!(
+        stats_after.utilization_rate_bps,
+        stats_before.utilization_rate_bps
+    );
+    assert_eq!(
+        stats_after.total_yield_distributed,
+        stats_before.total_yield_distributed
+    );
+    assert_eq!(
+        stats_after.total_loss_realised,
+        stats_before.total_loss_realised
+    );
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(stats_after.max_utilization_bps, stats_before.max_utilization_bps);
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+    assert_eq!(escrow.get_locked(&invoice_id), 0);
+    assert_eq!(escrow.get_locked_at(&invoice_id), 0);
+    assert!(escrow.get_history(&invoice_id).is_empty());
+}
 #[test]
 #[should_panic(expected = "Error(Contract, #12)")]
 fn test_fund_invoice_rejects_above_cap() {
