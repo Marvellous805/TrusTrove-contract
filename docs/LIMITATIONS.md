@@ -59,8 +59,18 @@ but the Stellar CLI is expected to be at the latest version
 ### Soroban Resource Model
 
 Soroban charges fees based on a budget model: each operation consumes
-CPU instructions, memory, and ledger I/O. The following are approximate
-relative costs based on code analysis.
+CPU instructions, memory, and ledger I/O.
+
+**Measured numbers** for the hot paths (`invoice::create`, `invoice::repay`,
+`pool::deposit`, `pool::fund_invoice`) come from the automated budget harness
+in [`contracts/pool/src/bench.rs`](../contracts/pool/src/bench.rs) (#734). It
+runs the real registry/invoice/escrow/pool contracts at 0, 10 and 50
+outstanding invoices and reports CPU instructions, memory bytes, ledger
+entries written, bytes written and TTL bumps per call — see
+[Automated Budget Benchmarks](#automated-budget-benchmarks) below. Rows marked
+**[measured](#automated-budget-benchmarks)** take their CPU/memory figures from
+that output; the remaining rows' cross-contract-call and transfer counts and
+the *Relative Budget* column are still derived from code analysis.
 
 | Operation | Cross-Contract Calls | Token Transfers | CPU Instructions | Memory (Bytes) | Relative Budget |
 |-----------|---------------------|-----------------|------------------|----------------|-----------------|
@@ -68,21 +78,21 @@ relative costs based on code analysis.
 | `registry::revoke` | 0 | 0 | — | — | Very Low |
 | `registry::get_profile_count` | 0 | 0 | — | — | Very Low |
 | `registry::list_profiles` | 0 | 0 | — | — | Low (O(limit), ≤ 50) |
-| `invoice::create` | 2 (`is_verified` ×2) | 0 | — | — | Low |
+| `invoice::create` | 2 (`is_verified` ×2) | 0 | [measured](#automated-budget-benchmarks) | [measured](#automated-budget-benchmarks) | Low |
 | `invoice::batch_create` | 2 per entry (`is_verified` ×2) | 0 | — | — | Low per entry, **up to 50× `create`** |
 | `invoice::list_for_financing` | 0 | 0 | — | — | Low |
 | `invoice::batch_list_for_financing` | 0 | 0 | — | — | Low per entry, **up to 50× `list_for_financing`** |
 | `invoice::mark_funded` | 0 | 0 | — | — | Low |
-| `invoice::repay` | 1 (`receive_repayment`) | 1 (buyer → pool) | — | — | Medium |
+| `invoice::repay` | 1 (`receive_repayment`) | 1 (buyer → pool) | [measured](#automated-budget-benchmarks) | [measured](#automated-budget-benchmarks) | Medium |
 | `invoice::trigger_default` | 1 (`handle_default`) | 0 | — | — | Medium |
 | `pool::deposit` (before refactor) | 0 | 1 (LP → pool) | ~456,800 | ~73,400 | Low-Medium |
 | `pool::deposit` (after `mint()`) | 0 | 1 (LP → pool) | 457,992 | 73,495 | Low-Medium |
 | `pool::withdraw` (before refactor) | 0 | 1 (pool → LP) | ~450,500 | ~63,550 | Medium |
 | `pool::withdraw` (after `burn()`) | 0 | 1 (pool → LP) | 451,634 | 63,660 | Medium |
-| `pool::fund_invoice` | 6 (`get_status`, `get_funding_asset`, `get_face_value`, `get_discount_bps`, `lock`, `mark_funded`) | 1 (pool → escrow) | — | — | **High** |
-| `pool::batch_fund_invoice` | 6 per entry | 1 per entry | — | — | **High** per entry, **up to 50× `fund_invoice`** |
+| `pool::fund_invoice` | 4 (`get_funding_context`, `lock`, `release_to_issuer`, `mark_funded`) | 2 (pool → escrow, escrow → issuer; #819 pays the issuer inside the call) | [measured](#automated-budget-benchmarks) | [measured](#automated-budget-benchmarks) | **High** |
+| `pool::batch_fund_invoice` | 4 per entry | 2 per entry | — | — | **High** per entry, **up to 50× `fund_invoice`** |
 | `pool::receive_repayment` | 0 | 0 | — | — | Low |
-| `pool::handle_default` | 1 (`escrow::handle_default`) | 1 (escrow → pool) | — | — | Medium |
+| `pool::handle_default` | 2 (`escrow::handle_default`, plus `escrow::was_released_to_issuer` when no live lock remains; #819) | 1 (escrow → pool) only when escrow still holds a live lock | — | — | Medium |
 | `pool_factory::register_existing_pool` | 0 | 0 | 69,486 | 7,604 | Low |
 | `escrow::lock` | 0 | 1 (pool → escrow) | — | — | Medium |
 | `escrow::release_to_issuer` | 0 | 1 (escrow → issuer) | — | — | Medium |
@@ -95,6 +105,50 @@ instance-local and costs the same in every contract; it is also what pushed a fe
 long-running integration tests past the default _test-host_ budget, which is why
 `pool_factory`'s test `setup()` lifts that budget — see
 [Batch Operations](#batch-operations).
+
+### Automated Budget Benchmarks
+
+`bench_core_flows_budget` in
+[`contracts/pool/src/bench.rs`](../contracts/pool/src/bench.rs) measures each
+hot path with the Soroban test host's budget tracker (`env.budget()`), resetting
+the budget immediately before the measured call so setup work never leaks into
+a row. Ledger I/O is derived by diffing the ledger snapshot before and after
+the call.
+
+```bash
+# Print the table (and write target/budget-bench.csv)
+cargo test -p trusttrove-pool bench_ -- --nocapture
+
+# Refresh the committed baseline, then review the diff
+BENCH_OUT=docs/benchmarks/budget.csv cargo test -p trusttrove-pool bench_
+git diff docs/benchmarks/budget.csv
+```
+
+Output is a sorted CSV with no timestamps, so two runs diff cleanly:
+
+```text
+op,volume,cpu_insns,mem_bytes,entries_written,bytes_written,ttl_bumps
+invoice::create,0,…,…,…,…,…
+invoice::create,10,…
+…
+pool::fund_invoice,50,…
+```
+
+| Column | Meaning |
+|--------|---------|
+| `volume` | Invoices already funded and outstanding when the call runs (0 / 10 / 50) |
+| `cpu_insns` | CPU instructions charged by the test host |
+| `mem_bytes` | Memory bytes charged by the test host |
+| `entries_written` | Ledger entries created, modified or deleted |
+| `bytes_written` | XDR size of the written entries (post-call) |
+| `ttl_bumps` | Entries whose TTL was extended without a data change |
+
+The test also **fails** if any measured call exceeds the per-transaction network
+limits (100M CPU instructions / 40 MiB memory), so a change that pushes
+`fund_invoice` past what a single transaction can carry is caught in CI.
+Limitations: ledger *reads* are not counted separately (their cost is included
+in `cpu_insns`), and test-host numbers track — but are not identical to — the
+fees simulated by RPC `simulateTransaction` against a real network.
 
 ### Measured Benchmarks: `deposit()` and `withdraw()` (SEP-41 mint/burn refactor)
 
@@ -194,13 +248,14 @@ FIFO/HIFO tax or reporting policy.
 
 ### Issuer Release Not Wired (Issue #56)
 
-After `fund_invoice` locks USDC in escrow, the pooled funds should be
-released to the issuer via `escrow.release_to_issuer()`. This call is
-**not yet wired** into `fund_invoice`. See
-[Issue #56](https://github.com/TrusTrove/TrusTrove-contract/issues/56).
-**Status:** Unresolved. This is the highest-priority gap before mainnet.
-**Workaround:** An admin or automated off-chain bot must call
-`escrow.release_to_issuer(invoice_id, issuer)` separately after funding.
+**Status: Resolved** by
+[#819](https://github.com/TrusTrove/TrusTrove-contract/issues/819) — see
+[Resolved](#resolved). `fund_invoice` now releases the funded amount to the
+issuer in the same call (`pool → escrow.lock → escrow.release_to_issuer`),
+restoring the flow originally wired in 5f6dc7c and later dropped. No
+off-chain bot is required. Repayment (`escrow.release_to_pool`) and default
+(`pool.handle_default`) were adapted to the lock record being consumed at
+funding time.
 
 ### No Early Repayment Incentive Logic
 
@@ -208,13 +263,6 @@ The protocol does not apply dynamic discount rates based on how early
 repayment occurs. The buyer pays the full `face_value` regardless of how
 early they repay, so there is no on-chain rebate proportional to the time
 remaining on the invoice.
-
-### No Accessor for `funded_amount` on Invoice Contract
-
-While `get_face_value`, `get_discount_bps`, and `get_funding_asset` are
-exposed as per-field view functions (one storage read each), there is no
-dedicated `get_funded_amount` accessor. Callers currently read the full
-`Invoice` struct via `get()`.
 
 ### No Duplicate Invoice Detection
 
@@ -242,7 +290,7 @@ terms.
 | Calling `batch_register_issuers` with more than 50 entries             | Panics with `BatchSizeExceeded`                                                                     | Gas protection                                                                                                                          |
 | A buyer repays _less_ than `face_value`                                | Not possible on the buyer path — `invoice.repay` transfers the full `face_value` from buyer to pool | Partial amounts are only possible through `escrow::release_to_pool` during default / partial-repayment flows; see [Resolved](#resolved) |
 | An issuer creates an invoice with `due_date = current_time + 1` second | Invoice accepted                                                                                    | `create` requires `due_date > env.ledger().timestamp()` (strict); `now + 1` passes, `now` does not                                      |
-| The pool has exactly 0 USDC balance after funding all deposits         | `withdraw` succeeds for unfunded amounts, but funded invoices are locked                            | Escrow holds funded USDC, pool holds only unfunded USDC                                                                                 |
+| The pool has exactly 0 USDC balance after funding all deposits         | `withdraw` succeeds for unfunded amounts, but funded invoices are locked                            | The issuer holds the funded USDC (paid out at funding, #819); escrow holds no balance for funded invoices and the pool holds only unfunded USDC  |
 | `trigger_default` while status is exactly at `due_date` (timestamp)    | Panics with `DueDateNotPassed`                                                                      | The guard is `if current_time <= due_date`, so one full second must elapse past `due_date` before default can fire                      |
 
 ---
@@ -270,18 +318,20 @@ are provided where available.
 
 - Mainnet deployment support (currently testnet only)
 - Formal verification or symbolic execution audit
-- `cargo-soroban` integration for automated WASM budget reporting
+- `cargo-soroban` integration for automated WASM budget reporting — test-host
+  budget harness shipped (#734, [Automated Budget Benchmarks](#automated-budget-benchmarks));
+  on-network WASM fee reporting via `simulateTransaction` is still planned
 - TypeScript SDK for contract interaction
 - Automated fuzz testing across all four contracts
 - Smart-contract upgrade mechanism (`__constructor` + `__upgrade`)
 
-> **Note:** Partial repayments are now supported on the **escrow** path
-> (`escrow::release_to_pool(invoice_id, repayment_amount)` accepts a
-> partial `repayment_amount` and tracks the residual in the escrow
-> record). They are **not** yet supported on the buyer-driven repayment
-> path (`invoice::repay` still requires the full `face_value`). This
-> item has been removed from the active scope above and moved to the
-> [Resolved](#resolved) section.
+> **Note:** Partial repayments are supported on both paths. On the
+> **escrow** path, `escrow::release_to_pool(invoice_id, repayment_amount)`
+> accepts a partial `repayment_amount` and tracks the residual in the
+> escrow record. On the **buyer-driven** path,
+> `invoice.repay_partial(invoice_id, amount)` accumulates installments
+> against the invoice's `remaining_balance` and only releases the escrow
+> to the pool once that balance reaches zero. See [Resolved](#resolved).
 
 ---
 
@@ -312,17 +362,43 @@ the 2025-07-25 revision.
   a `repayment_amount` that may be less than the original locked amount,
   keeps the residual escrow record in place, and emits history events
   per partial release. See PR #120
-  (`feat/partial-repayment-default-flow`). Buyer-driven partial
-  repayments via `invoice.repay` remain a future-feature — see
-  [Known Gaps](#known-gaps).
+  (`feat/partial-repayment-default-flow`).
+- **Buyer-driven partial repayment.** `invoice.repay_partial(invoice_id,
+  amount)` accepts an installment up to the invoice's
+  `remaining_balance`, leaves the invoice in its current status while a
+  balance remains, and transitions to `Repaid` only once `repaid_amount`
+  reaches `face_value`. Overpayments are rejected with
+  `InvoiceError::RepaymentExceedsBalance` (error code 25). See issue
+  [#728](https://github.com/TrusTrove/TrusTrove-contract/issues/728).
 - **Security findings #94, #96, #98, #103.** Addressed together in
   PR #124 (`fix: address security issues #94, #96, #98, #103`).
+- **Issuer payout at funding (#56, restored by #819).**
+  `pool::fund_invoice` calls `escrow::release_to_issuer(invoice_id, issuer)`
+  immediately after `escrow::lock`, so the issuer receives `funded_amount`
+  in the same transaction (originally wired in 5f6dc7c, dropped by a later
+  refactor, re-wired by
+  [#819](https://github.com/TrusTrove/TrusTrove-contract/issues/819)).
+  Because the `Locked` record is consumed at funding, repayment and default
+  key off durable payout evidence instead:
+  - `release_to_issuer` writes `DataKey::IssuerReleased(invoice_id)`
+    recording the paid-out amount.
+  - `escrow::release_to_pool` accepts either a live `Locked` record or the
+    marker — exactly one, consumed on use — so repayment still settles and
+    a second release still reverts with `NotFound` (#2 guard preserved).
+  - `escrow::handle_default` returns `false` when no live lock remains (a
+    funded invoice has none). `pool::handle_default` then reads
+    `escrow::was_released_to_issuer`: marker present means the principal is
+    already with the issuer, so the default books a real LP capital loss
+    (`TotalDeposits -= funded_amount`, keeping deposit accounting equal to
+    the pool's token balance; shares are still never burned, preserving
+    #439's no-burn property). No marker still reverts with
+    `EscrowDefaultNotReleased` (#21).
 
 ---
 
 ## Related Issues
 
-- [#56 — Wire issuer release into fund_invoice](https://github.com/TrusTrove/TrusTrove-contract/issues/56) (open)
+- [#56 — Wire issuer release into fund_invoice](https://github.com/TrusTrove/TrusTrove-contract/issues/56) (closed; the payout was later dropped by a refactor and re-wired by [#819](https://github.com/TrusTrove/TrusTrove-contract/issues/819))
 - [#285 — Event schema documentation](https://github.com/TrusTrove/TrusTrove-contract/issues/285)
 - [#286 — Gas budget report](https://github.com/TrusTrove/TrusTrove-contract/issues/286)
 - [#287 — Storage schema docs](https://github.com/TrusTrove/TrusTrove-contract/issues/287)
