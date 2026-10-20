@@ -163,6 +163,22 @@ impl MockToken {
 #[contracttype]
 pub struct TKey(Address);
 
+// --------------- Mock Escrow (lock failure) ---------------
+
+mod failing_escrow {
+    use soroban_sdk::{contract, contractimpl, Address, BytesN, Env};
+
+    #[contract]
+    pub struct MockFailingEscrow;
+
+    #[contractimpl]
+    impl MockFailingEscrow {
+        pub fn lock(_env: Env, _invoice_id: BytesN<32>, _amount: u128, _issuer: Address) -> bool {
+            panic!("escrow lock failed");
+        }
+    }
+}
+
 // --------------- Mock Invoice (unbounded face value) ---------------
 //
 // Stands in for the pool's configured invoice contract to prove that
@@ -449,6 +465,69 @@ fn create_and_list_with_params_and_term(
     attest_invoice(te, &invoice_id);
     te.invoice.list_for_financing(&invoice_id, &discount_bps);
     invoice_id
+}
+
+#[test]
+fn test_fund_invoice_escrow_lock_failure_preserves_state() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    let failing_escrow_id = te
+        .env
+        .register_contract(None, failing_escrow::MockFailingEscrow);
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &failing_escrow_id);
+    });
+
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let funded_key = DataKey::FundedInvoice(invoice_id.clone());
+    let stats_before = te.pool.get_stats();
+    let pool_balance_before = usdc.balance(&te.pool_id);
+    let invoice_status_before = te.invoice.get_status(&invoice_id);
+
+    let result = te.pool.try_fund_invoice(&invoice_id);
+    assert!(
+        result.is_err(),
+        "fund_invoice must revert when escrow.lock fails"
+    );
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(
+        stats_after.total_deposits, stats_before.total_deposits,
+        "total deposits must not change when escrow.lock fails"
+    );
+    assert_eq!(
+        stats_after.total_funded, stats_before.total_funded,
+        "total funded must not change when escrow.lock fails"
+    );
+    assert_eq!(
+        stats_after.active_invoice_count, stats_before.active_invoice_count,
+        "active invoice count must not change when escrow.lock fails"
+    );
+    assert_eq!(
+        stats_after.available_liquidity, stats_before.available_liquidity,
+        "available liquidity must not change when escrow.lock fails"
+    );
+    assert!(
+        !te.env.as_contract(&te.pool_id, || {
+            te.env.storage().persistent().has(&funded_key)
+        }),
+        "no funded invoice entry may remain when escrow.lock fails"
+    );
+    assert_eq!(
+        usdc.balance(&te.pool_id),
+        pool_balance_before,
+        "pool token balance must not change when escrow.lock fails"
+    );
+    assert_eq!(
+        te.invoice.get_status(&invoice_id),
+        invoice_status_before,
+        "invoice status must not change when escrow.lock fails"
+    );
 }
 
 fn fund_and_repay_invoice(te: &TestEnv) -> BytesN<32> {
@@ -1504,6 +1583,17 @@ fn test_get_usdc_asset_panics_when_uninitialized() {
     let pool_id = env.register_contract(None, PoolContract);
     let pool = PoolContractClient::new(&env, &pool_id);
     pool.get_usdc_asset();
+}
+
+// The canonical name must carry the same typed pre-initialization contract as
+// the deprecated alias (issue #954).
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_get_funding_asset_panics_when_uninitialized() {
+    let env = Env::default();
+    let pool_id = env.register_contract(None, PoolContract);
+    let pool = PoolContractClient::new(&env, &pool_id);
+    pool.get_funding_asset();
 }
 
 #[test]
