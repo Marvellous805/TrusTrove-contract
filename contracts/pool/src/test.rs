@@ -1610,9 +1610,15 @@ fn test_fund_invoice_rejects_funded_amount_overflow_without_state_changes() {
     let escrow = RealEscrowClient::new(&te.env, &te.escrow_id);
     let stats_before = te.pool.get_stats();
     let result = te.pool.try_fund_invoice(&invoice_id);
-    assert!(result.is_err(), "overflowing funded amount must be rejected");
+    assert!(
+        result.is_err(),
+        "overflowing funded amount must be rejected"
+    );
     let error = std::format!("{result:?}");
-    assert!(error.contains("#13"), "expected PoolError::Overflow: {error}");
+    assert!(
+        error.contains("#13"),
+        "expected PoolError::Overflow: {error}"
+    );
 
     let stats_after = te.pool.get_stats();
     assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
@@ -1633,9 +1639,15 @@ fn test_fund_invoice_rejects_funded_amount_overflow_without_state_changes() {
         stats_after.total_loss_realised,
         stats_before.total_loss_realised
     );
-    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(
+        stats_after.active_invoice_count,
+        stats_before.active_invoice_count
+    );
     assert_eq!(stats_after.total_shares, stats_before.total_shares);
-    assert_eq!(stats_after.max_utilization_bps, stats_before.max_utilization_bps);
+    assert_eq!(
+        stats_after.max_utilization_bps,
+        stats_before.max_utilization_bps
+    );
     assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
     assert_eq!(escrow.get_locked(&invoice_id), 0);
     assert_eq!(escrow.get_locked_at(&invoice_id), 0);
