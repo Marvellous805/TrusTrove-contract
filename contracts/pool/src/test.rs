@@ -5,7 +5,7 @@ extern crate std;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
+    contract, contracterror, contractimpl, contracttype,
     testutils::{
         storage::Instance as _, storage::Persistent as _, Address as _, Events as _, Ledger,
         MockAuth, MockAuthInvoke,
@@ -285,6 +285,22 @@ impl MockHugeFaceInvoice {
             .instance()
             .get(&InvKey(Symbol::new(&env, "disc")))
             .unwrap()
+    }
+}
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MockEscrowError {
+    LockCalled = 99,
+}
+
+#[contract]
+pub struct MockUnexpectedEscrow;
+
+#[contractimpl]
+impl MockUnexpectedEscrow {
+    pub fn lock(env: Env, _invoice_id: BytesN<32>, _amount: u128, _issuer: Address) -> bool {
+        soroban_sdk::panic_with_error!(&env, MockEscrowError::LockCalled);
     }
 }
 
@@ -1498,6 +1514,54 @@ fn test_fund_invoice_rejects_utilization_overflow() {
     let _ = te.pool.fund_invoice(&invoice_id);
 }
 
+#[test]
+fn test_fund_invoice_rejects_discount_above_max_before_escrow_or_state_update() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+
+    let invoice_id = BytesN::from_array(&te.env, &[8u8; 32]);
+    let invoice_contract = te.env.register_contract(None, MockHugeFaceInvoice);
+    MockHugeFaceInvoiceClient::new(&te.env, &invoice_contract).configure(
+        &te.issuer,
+        &te.buyer,
+        &te.usdc_id,
+        &10_000_000_000,
+        &10_001,
+    );
+    let escrow_id = te.env.register_contract(None, MockUnexpectedEscrow);
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::InvoiceContract, &invoice_contract);
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &escrow_id);
+    });
+
+    let stats_before = te.pool.get_stats();
+    let result = te.pool.try_fund_invoice(&invoice_id);
+    assert!(result.is_err());
+    let error = std::format!("{result:?}");
+    assert!(error.contains("#4"), "expected InvalidAmount: {error}");
+    assert!(
+        !error.contains("#99"),
+        "escrow lock must not be called: {error}"
+    );
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(
+        stats_after.active_invoice_count,
+        stats_before.active_invoice_count
+    );
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+}
 // A pathologically large face_value read from the invoice contract (the pool
 // does not bound cross-contract values itself) must trigger the typed
 // PoolError::Overflow (#13) in the funded_amount multiplication rather than

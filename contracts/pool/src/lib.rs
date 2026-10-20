@@ -1216,7 +1216,8 @@ impl PoolContract {
     /// * `BuyerNotVerified` if the invoice buyer's registry verification has
     ///   since been revoked.
     /// * `AssetMismatch` if the invoice funding asset does not match pool USDC.
-    /// * `InvalidAmount` if the computed funded amount is zero.
+    /// * `InvalidAmount` if `discount_bps` exceeds 10,000 or the computed
+    ///   funded amount is zero.
     /// * `InsufficientLiquidity` if the pool does not have enough funds.
     /// * `UtilizationCapExceeded` if funding would push utilization above the cap.
     /// * `Overflow` if `face_value * (10000 - discount_bps)` or the resulting
@@ -1310,6 +1311,9 @@ impl PoolContract {
         // must be guarded just like the utilization check below (#585).
         let face_value = ctx.face_value;
         let discount_bps = ctx.discount_bps;
+        if discount_bps > 10_000 {
+            panic_with_error!(&env, PoolError::InvalidAmount);
+        }
         let funded_amount = face_value
             .checked_mul(10000 - discount_bps as u128)
             .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow))
