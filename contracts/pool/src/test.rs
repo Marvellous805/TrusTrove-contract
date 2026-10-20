@@ -2920,10 +2920,20 @@ fn test_withdraw_all_shares_to_zero_then_redeposit() {
     assert_eq!(stats_after_withdraw.total_shares, 0);
     assert_eq!(stats_after_withdraw.total_deposits, 0);
 
-    // Verify LP has no position
+    // Verify the returned LP position and LP-scoped accounting are cleared.
     let pos = te.pool.get_lp_position(&te.lp);
     assert_eq!(pos.shares, 0);
     assert_eq!(pos.usdc_value, 0);
+    assert_eq!(pos.deposit_count, 0);
+
+    let init_dep_key = DataKey::LPInitialDeposit(te.lp.clone());
+    let dep_count_key = DataKey::LPDepositCount(te.lp.clone());
+    assert!(!te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().has(&init_dep_key)
+    }));
+    assert!(!te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().has(&dep_count_key)
+    }));
 
     // Re-deposit succeeds and is treated as a first-depositor (1:1 shares)
     let new_shares = te.pool.deposit(&te.lp, &5_000_000_000);
@@ -2936,7 +2946,17 @@ fn test_withdraw_all_shares_to_zero_then_redeposit() {
 
     let final_pos = te.pool.get_lp_position(&te.lp);
     assert_eq!(final_pos.shares, 5_000_000_000);
-    assert_eq!(final_pos.deposit_count, 1); // Reset on full withdrawal, so 1 deposit in this cycle
+    assert_eq!(final_pos.usdc_value, 5_000_000_000);
+    assert_eq!(final_pos.deposit_count, 1);
+
+    let fresh_principal: u128 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get(&init_dep_key).unwrap()
+    });
+    assert_eq!(fresh_principal, 5_000_000_000);
+    let fresh_count: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get(&dep_count_key).unwrap()
+    });
+    assert_eq!(fresh_count, 1);
 }
 
 //  ISSUE #258: RESET LP STATE ON FULL WITHDRAWAL
